@@ -33,6 +33,18 @@
 
 ---
 
+## 👤 내 역할 — 한정현 (JH)
+
+**담당: 백엔드 프레임워크 전환 · 날씨 추천 엔진 · 이미지 저장 인프라** (브랜치 `feat/jh`)
+
+- **Flask → FastAPI 마이그레이션** — 실시간 음성 스트리밍을 위해 async/WebSocket을 1급으로 지원하는 FastAPI로 서버를 전환, 단일 서버 통합 구조의 기반 마련
+- **날씨 기반 추천 엔진** — 기상청 단기예보 API 클라이언트(`weather_client`), 온도·강수·습도·일교차를 종합하는 날씨→스타일 매핑 엔진(`weather_style_mapper`), 옷장 매칭 로직(`recommend`) 구현
+- **체감 속도 최적화** — `quick=true`로 날씨/스타일을 ~1초에 먼저 응답하고 AI 코멘트(~4초)는 비동기 로드하는 2단계 응답 UX
+- **Cloudinary 이미지 인프라** — 사용자별 폴더 격리 저장, 옷 삭제 시 고아 폴더 자동 정리, DB↔스토리지 정합성 점검 유틸(`make_cloudinary_cleanup.py`)
+
+**기술 스택**: Python · FastAPI · Uvicorn · 기상청 OpenAPI · Cloudinary · async I/O
+---
+
 ## 📋 프로젝트 한눈에 보기
 
 | 항목 | 내용 |

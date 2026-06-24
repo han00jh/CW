@@ -23,11 +23,11 @@
 
 <br/>
 
-[![웹 대시보드 열기](https://img.shields.io/badge/🚀_웹_대시보드_열기-localhost:5000-22c55e?style=for-the-badge&logo=fastapi&logoColor=white)](http://localhost:5000/dashboard)
+[![웹 대시보드 열기](https://img.shields.io/badge/🚀_웹_대시보드_열기-localhost:5000-22c55e?style=for-the-badge&logo=fastapi&logoColor=white)](http://localhost:8000/dashboard)
 
 <sub>⚠️ 본인 컴퓨터에서 서버를 먼저 실행한 뒤 클릭 → **각자의 로컬 대시보드**가 열립니다 · [실행 방법 보기](#-시작하기)</sub>
 
-(프로젝트 폴더에서 실행 → `cd CW && docker-compose up` &nbsp;또는&nbsp; `cd CW && uvicorn app:app --host 0.0.0.0 --port 5000`)
+(프로젝트 폴더에서 실행 → `cd CW && docker-compose up` &nbsp;또는&nbsp; `cd CW && uvicorn app:app --host 0.0.0.0 --port 8000`)
 
 </div>
 

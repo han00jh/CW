@@ -19,8 +19,9 @@ Flask → FastAPI 마이그레이션 + 음성 파이프라인(voice/router.py) �
   POST /feedback/{log_id}    → 코디 피드백
   POST /chat                 → 챗봇 API
   GET  /api/weather          → 날씨 JSON
-  GET  /api/recommend        → 코디 추천 JSON
-  GET  /api/shopping         → 쇼핑 추천 JSON
+
+  
+  
   GET  /fashion-show         → 패션쇼 페이지
   + voice/* (voice/router.py)
 """
@@ -52,6 +53,12 @@ from werkzeug.utils import secure_filename
 from db import (
     db_engine, execute, executereturning, fetchall, fetchone,
     get_db, is_postgres, save_feedback, save_style_log,
+    # 누적 학습 관련 헬퍼 (2026-04-17)
+    save_correction, save_wardrobe_item_with_embedding,
+    # 피드백 성장 루프 (2026-04-17)
+    get_feedback_summary, get_style_report,
+    save_item_feedback, find_similar_items,
+    save_recommendation_items,
 )
 from voice.router import router as voice_router
 
@@ -399,8 +406,44 @@ def init_db():
                 ("avatar_url",    "TEXT"),
             ]:
                 execute(conn, f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {definition}")
-            execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx    ON users(email)     WHERE email IS NOT NULL")
-            execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS users_google_id_uidx ON users(google_id) WHERE google_id IS NOT NULL")
+            try:
+                execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS users_email_uidx    ON users(email)     WHERE email IS NOT NULL")
+                execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS users_google_id_uidx ON users(google_id) WHERE google_id IS NOT NULL")
+            except Exception:
+                pass
+            # style_logs / weather_logs: init.sql로 생성되지만 기존 DB 볼륨에는 없을 수 있음
+            execute(conn, """
+                CREATE TABLE IF NOT EXISTS weather_logs (
+                    id           SERIAL PRIMARY KEY,
+                    log_date     DATE DEFAULT CURRENT_DATE,
+                    location_nx  SMALLINT,
+                    location_ny  SMALLINT,
+                    morning_tmp  REAL,
+                    afternoon_tmp REAL,
+                    evening_tmp  REAL,
+                    morning_reh  REAL,
+                    precip_type  SMALLINT,
+                    temp_range   REAL,
+                    raw_data     JSONB,
+                    created_at   TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+            execute(conn, """
+                CREATE TABLE IF NOT EXISTS style_logs (
+                    id             SERIAL PRIMARY KEY,
+                    user_id        UUID REFERENCES users(id) ON DELETE SET NULL,
+                    weather_log_id INTEGER REFERENCES weather_logs(id) ON DELETE SET NULL,
+                    log_date       DATE DEFAULT CURRENT_DATE,
+                    tpo            VARCHAR(20),
+                    style_rec      JSONB,
+                    layering_info  JSONB,
+                    ai_comment     TEXT,
+                    feedback_score SMALLINT,
+                    feedback_text  TEXT,
+                    was_worn       BOOLEAN,
+                    created_at     TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
         print(f"[DB] {db_engine()} 연결됨")
         return
 
@@ -540,13 +583,18 @@ async def auth_google(request: Request):
     if not _GOOGLE_ENABLED or not _oauth:
         flash(request, "Google 로그인이 설정되지 않았습니다.", "error")
         return RedirectResponse("/login", status_code=302)
+    if not is_postgres():
+        # 콜백이 %s 플레이스홀더/RETURNING을 쓰므로 SQLite에서는 지원 불가
+        flash(request, "Google 로그인은 PostgreSQL 환경에서만 지원됩니다.", "error")
+        return RedirectResponse("/login", status_code=302)
     redirect_uri = str(request.url_for("auth_google_callback"))
     return await _oauth.google.authorize_redirect(request, redirect_uri)
 
 
 @app.get("/auth/google/callback", name="auth_google_callback")
 async def auth_google_callback(request: Request):
-    if not _GOOGLE_ENABLED or not _oauth:
+    if not _GOOGLE_ENABLED or not _oauth or not is_postgres():
+        # 아래 쿼리는 Postgres 전용(%s/RETURNING) — SQLite에서는 콜백 진입 차단
         return RedirectResponse("/login", status_code=302)
     try:
         token     = await _oauth.google.authorize_access_token(request)
@@ -735,14 +783,18 @@ async def wardrobe_add(request: Request):
         saved.append((local_path, file.filename))
 
     # ── 2. 배치 분석 (한 번의 forward pass로 전체 처리 → 속도 개선) ──
+    #    return_embedding=True : pgvector 저장용 임베딩 함께 받기 (2026-04-17)
     try:
         local_paths = [lp for lp, _ in saved]
         print(f"[wardrobe_add] 분석 시작: {len(local_paths)}장")
-        results = await asyncio.to_thread(analyze_outfit_batch, local_paths)
+        results = await asyncio.to_thread(analyze_outfit_batch, local_paths, True)
         for fname, res in zip([os.path.basename(p) for p in local_paths], results):
             cat  = next((k for k in ["아우터","원피스","상의","하의","신발","악세서리"] if k in res), "?")
             item = res.get(cat, {}).get("item", "?") if cat != "?" else "?"
-            print(f"[wardrobe_add] {fname[:30]} → 카테고리={cat}, 아이템={item}")
+            src  = res.get("_source", "?")
+            conf = res.get("_confidence", 0)
+            print(f"[wardrobe_add] {fname[:30]} → {cat}/{item} "
+                  f"(conf={conf:.2f}, src={src})")
     except Exception as e:
         import traceback; traceback.print_exc()
         for lp, _ in saved:
@@ -773,21 +825,22 @@ async def wardrobe_add(request: Request):
             )
 
             # Cloudinary 성공 후에만 DB에 기록 (트랜잭션 보장)
+            # 2026-04-17: 예측/임베딩을 함께 저장 — 누적 학습 파이프라인의 입력 자산
             try:
-                with get_db() as conn:
-                    if is_postgres():
-                        execute(conn, """
-                            INSERT INTO wardrobe_items
-                                (user_id, image_path, category, item_type, warmth, texture, created_at)
-                            VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                        """, (user.id, save_path, category, item_name, item_warmth, item_texture))
-                    else:
-                        execute(conn, """
-                            INSERT INTO wardrobe_items
-                                (user_id, image_path, category, item_type, warmth, texture, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (user.id, save_path, category, item_name, item_warmth, item_texture,
-                              datetime.now().isoformat()))
+                embedding  = result.get("_embedding")          # list[float] 또는 None
+                confidence = result.get("_confidence")         # 0~1 argmax 확률
+                source     = result.get("_source", "marqo")    # 'marqo' | 'custom:...'
+                save_wardrobe_item_with_embedding(
+                    user_id=user.id,
+                    image_path=save_path,
+                    category=category,
+                    item_type=item_name,
+                    warmth=item_warmth,
+                    texture=item_texture,
+                    embedding=embedding,
+                    confidence=confidence,
+                    source=source,
+                )
             except Exception as e:
                 try:
                     delete_image(save_path)
@@ -817,15 +870,113 @@ async def wardrobe_add(request: Request):
 
 @app.post("/wardrobe/move/{item_id}", name="wardrobe_move")
 async def wardrobe_move(item_id: int, request: Request):
+    """
+    드래그&드롭으로 카테고리 이동 = 사용자 정정(학습 데이터).
+    2026-04-17: 단순 UPDATE → save_correction() 으로 변경
+    → corrected_category, label_source='user_corrected', corrected_at 기록.
+    predicted_category 는 건드리지 않음 (원본 예측 보존).
+    """
     _require_user(request)
     data         = await request.json()
     new_category = data.get("category")
     if new_category not in ["상의", "하의", "원피스", "아우터", "신발", "악세서리"]:
         return JSONResponse({"error": "invalid category"}, status_code=400)
-    ph = "%s" if is_postgres() else "?"
-    with get_db() as conn:
-        execute(conn, f"UPDATE wardrobe_items SET category={ph} WHERE id={ph}", (new_category, item_id))
+    save_correction(item_id, corrected_category=new_category)
     return JSONResponse({"ok": True})
+
+
+@app.post("/wardrobe/correct/{item_id}", name="wardrobe_correct")
+async def wardrobe_correct(item_id: int, request: Request):
+    """
+    세부 item_type 정정 (예: "shirt" → "blouse"). 선택적으로 category도 함께.
+    body: {"item_type": "...", "category": "..."?}   둘 중 하나 이상 필수
+    body: {}  또는 {"verify": true}  → 기존 값이 맞다고 확인 (label_source='verified')
+    """
+    _require_user(request)
+    data = await request.json()
+    verify = bool(data.get("verify"))
+    new_item_type = data.get("item_type")
+    new_category  = data.get("category")
+
+    if verify and not new_item_type and not new_category:
+        save_correction(item_id)  # verify-only
+        return JSONResponse({"ok": True, "mode": "verified"})
+
+    if not new_item_type and not new_category:
+        return JSONResponse({"error": "item_type or category required"}, status_code=400)
+
+    if new_category and new_category not in ["상의", "하의", "원피스", "아우터", "신발", "악세서리"]:
+        return JSONResponse({"error": "invalid category"}, status_code=400)
+
+    save_correction(item_id,
+                    corrected_category=new_category,
+                    corrected_item_type=new_item_type)
+    return JSONResponse({"ok": True, "mode": "corrected"})
+
+
+@app.post("/feedback/style/{log_id}", name="feedback_style")
+async def feedback_style(log_id: int, request: Request):
+    """
+    오늘의 코디 추천 전체에 대한 피드백 저장.
+    body: {"score": 5, "text": "오늘 딱 좋았어", "was_worn": true}
+    score: 1(싫어요) ~ 5(좋아요). 단순 좋아요/싫어요는 score=5/1 로 전송.
+    """
+    _require_user(request)
+    data = await request.json()
+    score    = data.get("score")
+    text     = data.get("text") or None
+    was_worn = data.get("was_worn")
+    save_feedback(log_id, score=score, text=text, was_worn=was_worn)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/style-report", name="api_style_report")
+def api_style_report(request: Request):
+    """프로필 페이지 '스타일 리포트' — 피드백 통계 + 카테고리 선호도."""
+    user = _require_user(request)
+    return JSONResponse(get_style_report(user.id))
+
+
+@app.post("/feedback/item/{rec_item_id}", name="feedback_item")
+async def feedback_item(rec_item_id: int, request: Request):
+    """
+    추천 받은 개별 아이템에 대한 좋아요/싫어요 + 실제 착용 여부.
+    body: {"liked": true|false|null, "was_worn": true|false|null}
+    → recommendation_items 테이블에 기록 → re-ranker 학습 라벨.
+    """
+    _require_user(request)
+    data = await request.json()
+    save_item_feedback(rec_item_id,
+                       liked=data.get("liked"),
+                       was_worn=data.get("was_worn"))
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/wardrobe/similar/{item_id}", name="api_similar")
+def api_similar(item_id: int, request: Request, limit: int = 10):
+    """
+    pgvector 기반 "비슷한 옷" 검색. 라벨 없이도 데이터 쌓일수록 품질 향상.
+    해당 item의 embedding을 쿼리로 사용 → 유저 본인 옷장 내에서 최근접 이웃 반환.
+    """
+    user = _require_user(request)
+    if not is_postgres():
+        return JSONResponse({"items": [], "note": "retrieval requires PostgreSQL+pgvector"})
+    # 쿼리 아이템의 임베딩 로드
+    with get_db() as conn:
+        row = fetchone(conn,
+            "SELECT embedding::text AS emb FROM wardrobe_items WHERE id=%s",
+            (item_id,))
+    if not row or not row.get("emb"):
+        return JSONResponse({"items": []})
+    import json as _json
+    try:
+        emb = _json.loads(row["emb"])
+    except Exception:
+        return JSONResponse({"items": []})
+    similar = find_similar_items(emb, user_id=user.id,
+                                 limit=min(limit, 50),
+                                 exclude_item_id=item_id)
+    return JSONResponse({"items": similar})
 
 
 @app.post("/wardrobe/delete/{item_id}", name="wardrobe_delete")
@@ -1031,14 +1182,30 @@ async def api_recommend(request: Request, quick: bool = False):
                 tpo = _detected
 
         trend_news: list = []
+        # 피드백 히스토리 → Claude 프롬프트 컨텍스트로 주입
+        feedback_summary = get_feedback_summary(user.id)
+
         outfit_result = await asyncio.to_thread(
             get_outfit_comment, weather, style_rec, layering, str(tpo),  # type: ignore[arg-type]
-            profile or None, wardrobe_for_ai, trend_news, calendar_events
+            profile or None, wardrobe_for_ai, trend_news, calendar_events,
+            feedback_summary or None
         )
         comment = outfit_result.get("comment", "") if isinstance(outfit_result, dict) else outfit_result
         bubbles = outfit_result.get("bubbles", {}) if isinstance(outfit_result, dict) else {}
 
-        save_style_log(user.id, weather, style_rec, layering, comment, tpo)
+        style_log_id = save_style_log(user.id, weather, style_rec, layering, comment, tpo)
+
+        # 추천된 옷장 아이템을 recommendation_items에 연결 저장
+        # (style_logs ↔ wardrobe_items 매핑 → top_outfits_by_weather VIEW·재랭킹 학습 입력)
+        if style_log_id:
+            rec_items = [
+                {"wardrobe_item_id": entry["id"], "category": cat,
+                 "item_type": entry["item_type"]}
+                for cat, entries in wardrobe_matches.items()
+                for entry in entries
+            ]
+            if rec_items:
+                save_recommendation_items(style_log_id, rec_items)
 
         user_profile_data = {
             "name":        profile.get("name", ""),
@@ -1051,11 +1218,12 @@ async def api_recommend(request: Request, quick: bool = False):
             "tpo":         profile.get("tpo", "일상"),
         }
         full_result = {**quick_result, "comment": comment, "bubbles": bubbles,
-                       "user_profile": user_profile_data}
+                       "user_profile": user_profile_data,
+                       "style_log_id": style_log_id}
         _recommend_cache[cache_key_full] = {"data": full_result, "ts": time.time()}
         return JSONResponse(full_result)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": str(e), "error_type": type(e).__name__}, status_code=500)
 
 
 @app.get("/api/wardrobe", name="api_wardrobe")
@@ -1144,7 +1312,7 @@ async def api_shopping(request: Request):
         )
         return JSONResponse({"cards": cards})
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": str(e), "error_type": type(e).__name__}, status_code=500)
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -100,18 +100,17 @@
 
 ## 🖥️ 데모 & 스크린샷
 
-> 📸 아래 자리표시자를 실제 캡처로 교체하세요. `docs/screenshots/` 폴더를 만들고 이미지를 넣은 뒤 경로만 바꾸면 됩니다.
 
 <div align="center">
 
 | 메인 대시보드 | AI 수석 디자이너 패널 |
 |:---:|:---:|
-| <img src="docs/screenshots/dashboard.png" width="420" alt="대시보드"/> | <img src="docs/screenshots/designer.png" width="420" alt="수석 디자이너 패널"/> |
+| <img src="dashboard.jng" width="420" alt="대시보드"/> | <img src="designer.png" width="420" alt="수석 디자이너 패널"/> |
 | 날씨·오늘의 코디·3D 캐릭터 | 음성 대화 + 옷장 아이템 직접 언급 |
 
 | 옷장 관리 | 음성 인터랙션 (티키타카) |
 |:---:|:---:|
-| <img src="docs/screenshots/wardrobe.png" width="420" alt="옷장"/> | <img src="docs/screenshots/voice.png" width="420" alt="음성 대화"/> |
+| <img src="wardrobe.png" width="420" alt="옷장"/> | <img src="voice.png" width="420" alt="음성 대화"/> |
 | AI 자동 분류 결과 + 사용자 정정 | 마이크 ON → 끼어들기 → 이어읽기 |
 
 </div>

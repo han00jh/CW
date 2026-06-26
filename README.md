@@ -105,7 +105,7 @@
 
 | 메인 대시보드 | AI 수석 디자이너 패널 |
 |:---:|:---:|
-| <img src="dashboard.jng" width="420" alt="대시보드"/> | <img src="designer.png" width="420" alt="수석 디자이너 패널"/> |
+| <img src="dashboard.jpg" width="420" alt="대시보드"/> | <img src="designer.png" width="420" alt="수석 디자이너 패널"/> |
 | 날씨·오늘의 코디·3D 캐릭터 | 음성 대화 + 옷장 아이템 직접 언급 |
 
 | 옷장 관리 | 음성 인터랙션 (티키타카) |
